@@ -1,0 +1,10 @@
+venv/
+main_code/
+local_storage/
+trip_images/
+uploads/
+.env
+run.sh
+master_code.py
+_test.ipynb
+test.ipynb
