@@ -9,3 +9,6 @@ run.sh
 master_code.py
 _test.ipynb
 test.ipynb
+invoice_store/
+invoice_store300/
+invoices.db

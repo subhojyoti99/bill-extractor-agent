@@ -7,9 +7,7 @@ import subprocess
 import re
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
-import base64
 from datetime import datetime
-import aspose.pdf as ap
 from pydantic import BaseModel, Field
 import traceback
 from PIL import Image
@@ -17,7 +15,6 @@ import pandas as pd
 import shutil
 import matplotlib.pyplot as plt
 from io import StringIO
-from pandas.tseries.offsets import MonthBegin
 import threading
 import fitz  # PyMuPDF
 from PIL import Image
@@ -25,21 +22,23 @@ import shelve
 
 # Vector Database and Embedding
 from sentence_transformers import SentenceTransformer
-from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
 
 # LLM and Chain Components
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
-from langchain.memory import ConversationBufferMemory
 from langchain.schema import HumanMessage
-from langchain.schema.runnable import RunnableMap
 from langchain.schema import StrOutputParser
 import google.generativeai as genai
 from langchain_experimental.agents import create_pandas_dataframe_agent
-from langchain_anthropic import ChatAnthropic
-from langchain_groq import ChatGroq
+
+from langchain.vectorstores import Chroma
+from langchain.docstore.document import Document
+from langchain.embeddings import FastEmbedEmbeddings
+from langchain.chains import RetrievalQA
+from langchain_openai import ChatOpenAI
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import sqlite3
 
 # Load environment variables
 load_dotenv()
@@ -62,10 +61,12 @@ CACHE_DIR = os.path.join(LOCAL_STORAGE_ROOT, "cache")
 INVOICES_DIR = os.path.join(LOCAL_STORAGE_ROOT, "invoices")
 EXTRACTS_DIR = os.path.join(LOCAL_STORAGE_ROOT, "extracts")
 
+
 for dir_path in [EMBEDDINGS_DIR, CACHE_DIR, INVOICES_DIR, EXTRACTS_DIR]:
     os.makedirs(dir_path, exist_ok=True)
 
 # Configuration
+DB_PATH = os.path.join(EXTRACTS_DIR, "invoices.db")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 # TARGET_PHONE_NUMBER = os.getenv("TARGET_PHONE_NUMBER")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -171,33 +172,6 @@ class InvoiceData(BaseModel):
     )
 
 
-def setup_vector_store():
-    try:
-        # Initialize embedding model
-        embeddings = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-
-        # Check if we have existing embeddings
-        if os.path.exists(os.path.join(EMBEDDINGS_DIR, "index.faiss")):
-            vectorstore = FAISS.load_local(
-                EMBEDDINGS_DIR,
-                embeddings,
-                allow_dangerous_deserialization=True,  # Add this line
-            )
-            logger.info("Loaded existing FAISS vectorstore")
-        else:
-            # Create new empty vectorstore
-            vectorstore = FAISS.from_texts(
-                texts=["Sample text"], embedding=embeddings, metadatas=[{}]
-            )
-            vectorstore.save_local(EMBEDDINGS_DIR)
-            logger.info("Created new FAISS vectorstore")
-
-        return vectorstore
-    except Exception as e:
-        logger.error(f"Error setting up vector store: {str(e)}")
-        raise
-
-
 def store_uploaded_file(file_path: str) -> str:
     """Store uploaded file in local invoices directory"""
     try:
@@ -283,95 +257,127 @@ def save_results_to_sheet(results: List[Dict[str, Any]]) -> str:
         return None
 
 
-def update_processed_files(filename, status="SUCCESS", error_message=None):
-    try:
-        # Create or update processing log
-        log_path = os.path.join(EXTRACTS_DIR, "processing_log.csv")
 
-        log_entry = {
-            "Filename": filename,
-            "ProcessingDate": datetime.now().isoformat(),
-            "Status": status,
-            "ErrorDetails": error_message or "",
-        }
+def save_invoices_to_sqlite(df: pd.DataFrame):
+    """
+    Save invoice dataframe into SQLite database.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
 
-        # Append to log file
-        if os.path.exists(log_path):
-            df = pd.read_csv(log_path)
-            df = pd.concat([df, pd.DataFrame([log_entry])], ignore_index=True)
-        else:
-            df = pd.DataFrame([log_entry])
+    # Create table if not exists
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS invoices (
+        Invoice_Number TEXT,
+        Invoice_Date TEXT,
+        Net_SUM REAL,
+        Gross_SUM REAL,
+        VAT_Percentage REAL,
+        VAT_Amount REAL,
+        Invoice_Sender_Name TEXT,
+        Invoice_Sender_Address TEXT,
+        Invoice_Recipient_Name TEXT,
+        Invoice_Recipient_Address TEXT,
+        Invoice_Payment_Terms TEXT,
+        Payment_Method TEXT,
+        Category_Classification TEXT,
+        Is_Subscription TEXT,
+        START_Date TEXT,
+        END_Date TEXT,
+        Tips TEXT,
+        Handwritten_Comment TEXT,
+        Model_Abouts TEXT
+    )
+    """)
 
-        df.to_csv(log_path, index=False)
-        logger.info(f"Updated processing status for {filename}: {status}")
+    # Insert or replace (avoids duplicates on same Invoice_Number)
+    for _, row in df.iterrows():
+        cursor.execute("""
+        INSERT OR REPLACE INTO invoices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            row['Invoice_Number'],
+            row['Invoice_Date'],
+            row['Net_SUM'],
+            row['Gross_SUM'],
+            row['VAT_Percentage'],
+            row['VAT_Amount'],
+            row['Invoice_Sender_Name'],
+            row['Invoice_Sender_Address'],
+            row['Invoice_Recipient_Name'],
+            row['Invoice_Recipient_Address'],
+            row['Invoice_Payment_Terms'],
+            row['Payment_Method'],
+            row['Category_Classification'],
+            row['Is_Subscription'],
+            row['START_Date'],
+            row['END_Date'],
+            row['Tips'],
+            row['Handwritten_Comment'],
+            str(row['Model_Abouts'])  # ensure JSON/dict converted to string
+        ))
 
-    except Exception as e:
-        logger.error(f"Error updating processed files: {str(e)}")
-
-
-def log_invoice_query_interaction(query, input_tokens, output_tokens, response):
-    try:
-        log_path = os.path.join(EXTRACTS_DIR, "query_logs.csv")
-
-        log_entry = {
-            "Timestamp": datetime.now().isoformat(),
-            "Query": query,
-            "InputTokens": input_tokens,
-            "OutputTokens": output_tokens,
-            "Response": response[:500],  # Truncate for safety
-        }
-
-        # Append to log file
-        if os.path.exists(log_path):
-            df = pd.read_csv(log_path)
-            df = pd.concat([df, pd.DataFrame([log_entry])], ignore_index=True)
-        else:
-            df = pd.DataFrame([log_entry])
-
-        df.to_csv(log_path, index=False)
-        logger.info(f"Logged query to query_logs.csv: {query[:60]}...")
-
-    except Exception as e:
-        logger.error(f"Failed to log query: {str(e)}")
+    conn.commit()
+    conn.close()
+    logger.info("✅ Invoices saved to SQLite database at %s", DB_PATH)
 
 
 def embed_and_upload_invoice_data():
     try:
-        # Get all extracted invoice files
-        extract_files = [
-            f
-            for f in os.listdir(EXTRACTS_DIR)
-            if f.startswith("invoice_results_") and f.endswith(".xlsx")
-        ]
-
-        if not extract_files:
-            logger.warning("No invoice data files found")
-            return False
-
         # Load the most recent extract
-        latest_file = max(
-            extract_files, key=lambda f: os.path.getmtime(os.path.join(EXTRACTS_DIR, f))
-        )
-        df = pd.read_excel(os.path.join(EXTRACTS_DIR, latest_file))
+        file_path = os.path.join(EXTRACTS_DIR, "extractedData.xlsx")
 
-        # Prepare data for embedding
-        texts = []
-        metadatas = []
-
+        if not os.path.exists(file_path):
+            response = "❌ No invoice data found in local database."
+            return response
+        
+        df = pd.read_excel(file_path, sheet_name="Invoices")
+        save_invoices_to_sqlite(df)
+        markdown_rows = []
         for _, row in df.iterrows():
-            # Create a text representation of the invoice data
-            text_content = " | ".join(
-                [f"{k}: {v}" for k, v in row.items() if pd.notna(v)]
-            )
-            texts.append(text_content)
-            metadatas.append(row.to_dict())
+            row_markdown = f"""
+            ### Invoice Record
+            - Invoice Number: {row['Invoice_Number']}
+            - Invoice Date: {row['Invoice_Date']}
+            - Net SUM: {row['Net_SUM']}
+            - Gross SUM: {row['Gross_SUM']}
+            - VAT %: {row['VAT_Percentage']}
+            - VAT Amount: {row['VAT_Amount']}
+            - Sender: {row['Invoice_Sender_Name']}
+            - Sender Address: {row['Invoice_Sender_Address']}
+            - Recipient: {row['Invoice_Recipient_Name']}
+            - Recipient Address: {row['Invoice_Recipient_Address']}
+            - Payment Terms: {row['Invoice_Payment_Terms']}
+            - Payment Method: {row['Payment_Method']}
+            - Category: {row['Category_Classification']}
+            - Is Subscription: {row['Is_Subscription']}
+            - Start Date: {row['START_Date']}
+            - End Date: {row['END_Date']}
+            - Tips: {row['Tips']}
+            - Handwritten Comment: {row['Handwritten_Comment']}
+            - Model About: {row['Model_Abouts']}
+            """
+            markdown_rows.append(row_markdown.strip())
 
-        vectorstore = setup_vector_store()
+        docs = [Document(page_content=row, metadata={"source": file_path}) for row in markdown_rows]
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=100)
+        chunks = splitter.split_documents(docs)
 
-        # Add new texts to the vectorstore
-        vectorstore.add_texts(texts=texts, metadatas=metadatas)
-        vectorstore.save_local(EMBEDDINGS_DIR)
+        # ✅ Setup vector DB
+        embedding = FastEmbedEmbeddings()
+        db = Chroma(
+            embedding_function=embedding,
+            collection_name="invoices",
+            persist_directory="invoice_store"
+        )
+        client = db._client  # chromadb.Client
+        collections = [c.name for c in client.list_collections()]
+        if "invoices" in collections:
+            logger.info("Deleting existing 'invoices' collection before re-embedding")
+            client.delete_collection("invoices")
 
+        db.delete_collection()
+        
+        db.add_documents(chunks)
         logger.info(f"Successfully embedded and uploaded {len(texts)} invoice records")
         return True
     except Exception as e:
@@ -496,10 +502,6 @@ def analyze_invoice(image_path: str, filename: str, context: str = "") -> Invoic
         logger.error(f"Error analyzing invoice: {str(e)}")
         raise
 
-
-# [Rest of the original functions like df_to_trip_png, markdown_to_df, etc. remain the same]
-
-
 # Router prompt for determining type of query
 def create_router_chain():
     llm = ChatGoogleGenerativeAI(
@@ -530,70 +532,6 @@ def create_router_chain():
     return router_chain
 
 
-def setup_rag_system():
-    try:
-        # Initialize vector store
-        vectorstore = setup_vector_store()
-
-        # Create retriever
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-        logger.info(f"Retriever initialized: {type(retriever)} | {retriever}")
-        # Initialize memory for conversations
-        memory = ConversationBufferMemory(
-            memory_key="chat_history", return_messages=True
-        )
-
-        # Initialize LLM as you can buy gemini-1.5-pro
-        # llm = ChatGoogleGenerativeAI(
-        #     model="gemini-2.5-pro",
-        #     google_api_key=GOOGLE_API_KEY,
-        #     temperature=0.1,
-        # )
-
-        llm = ChatGroq(
-            api_key=GROQ_API_KEY,
-            model="deepseek-r1-distill-llama-70b",
-            temperature=0,
-            max_tokens=None,
-            timeout=None,
-            max_retries=2,
-        )
-
-        # Define prompt template for invoice RAG
-        invoice_prompt_template = """
-        You are an expert invoice processing assistant. Use the following retrieved information to answer the user's question accurately and professionally.
-        
-        Retrieved information:
-        {context}
-        
-        Current conversation:
-        {chat_history}
-        
-        Question: {question}
-        
-        Provide a concise and helpful answer using only the information from the retrieved context. If the answer is not in the context, politely say that you don't have that information.
-        """
-
-        # Create prompt
-        invoice_prompt = PromptTemplate(
-            input_variables=["context", "chat_history", "question"],
-            template=invoice_prompt_template,
-        )
-
-        # Create conversational chain
-        qa_chain = ConversationalRetrievalChain.from_llm(
-            llm,
-            retriever=retriever,
-            memory=memory,
-            combine_docs_chain_kwargs={"prompt": invoice_prompt},
-        )
-
-        return qa_chain
-    except Exception as e:
-        logger.error(f"Error setting up RAG system: {str(e)}")
-        raise
-
-
 def pdf_to_image(pdf_path, page_num=0, output_path="page.jpg"):
     try:
         doc = fitz.open(pdf_path)
@@ -605,18 +543,61 @@ def pdf_to_image(pdf_path, page_num=0, output_path="page.jpg"):
         raise Exception("Error converting PDF to image")
 
 
-def create_pandas_agent(df):
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-pro",
-        google_api_key=GOOGLE_API_KEY,
-        temperature=0.2,
-        max_execution_time=1,
-    )
-    agent = create_pandas_dataframe_agent(
-        llm, df, handle_parsing_errors=True, verbose=True, allow_dangerous_code=True
-    )
-    return agent
+def create_excel_agent(full_prompt: str) -> str:
+    try:
+        
+        embedding = FastEmbedEmbeddings()
+        db = Chroma(
+            embedding_function=embedding,
+            collection_name="invoices",
+            persist_directory="invoice_store"
+        )
 
+        retriever = db.as_retriever(search_kwargs={"k": 10})
+
+        # ✅ Setup LLM
+        llm = ChatOpenAI(
+            model="llama3-70b-8192",
+            temperature=0.2,
+            top_p=0.9,
+            openai_api_key=GROQ_API_KEY,
+            openai_api_base="https://api.groq.com/openai/v1"
+        )
+
+        prompt = PromptTemplate(
+            template=("""
+                You are a helpful invoice assistant.
+                Carefully check all the invoices details while responding.
+                Most Important: Do not modify invoice numbers (keep exact format, 
+                even if they include special characters like / or П).
+                      
+                Context:
+                {context}
+
+                Question:
+                {question}
+
+                Answer:
+            """),
+            input_variables=["context", "question"],
+        )
+
+        qa = RetrievalQA.from_chain_type(
+            llm=llm,
+            retriever=retriever,
+            chain_type="stuff",
+            chain_type_kwargs={"prompt": prompt},
+            return_source_documents=True
+        )
+
+        # ✅ Run the query
+        agent_result = qa.invoke({"query": f"Answer this query about invoices: {full_prompt}."})
+        return agent_result["result"]
+
+    except Exception as e:
+        logger.error(f"Error during RAG query: {str(e)}")
+        return "❌ Error accessing invoice data. Please try again."
+    
 
 def create_focused_query(full_prompt: str, query_params: dict) -> str:
     return f"""
@@ -711,30 +692,23 @@ def df_to_trip_png(df: pd.DataFrame, output_folder="trip_images") -> str:
         print(f"Error generating PNG from DataFrame: {str(e)}")
         return None
 
+def create_pandas_agent(df):
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-pro",
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0.2,
+        max_execution_time=1,
+    )
+    agent = create_pandas_dataframe_agent(
+        llm, df, handle_parsing_errors=True, verbose=True, allow_dangerous_code=True
+    )
+    return agent
 
 class SignalBot:
     def __init__(self, phone_number: str):
         self.phone_number = phone_number
         self.event_db = LocalCache("events")  # Local cache for events
         self.cache_db = LocalCache("messages")  # Local cache for messages
-
-        # Initialize LLM
-        self.llm = ChatGroq(
-            api_key=GROQ_API_KEY,
-            model="deepseek-r1-distill-llama-70b",
-            temperature=0,
-            max_tokens=None,
-            timeout=None,
-            max_retries=2,
-        )
-        # self.llm = ChatGoogleGenerativeAI(
-        #     model="gemini-2.5-pro",
-        #     google_api_key=GOOGLE_API_KEY,
-        #     temperature=0.1,
-        # )
-
-        # Initialize RAG chain
-        self.rag_chain = setup_rag_system()
 
         # Initialize router chain
         self.router_chain = create_router_chain()
@@ -797,8 +771,6 @@ class SignalBot:
                                     )
                                 )
 
-                                update_processed_files(filename, status="SUCCESS")
-
                                 if extracted_data and extracted_data.get(
                                     "Is_Invoice", False
                                 ):
@@ -860,12 +832,6 @@ class SignalBot:
                 threading.Thread(target=process_batch_attachments, daemon=True).start()
                 return response
 
-                # error_response = (
-                #     "❌ Please send only one attachment at a time (image or PDF)."
-                # )
-                # self.send_message(sender, error_response)
-                # return error_response
-
             if has_attachment and attachments[0].lower().endswith(".pdf"):
                 file_path = pdf_to_image(attachments[0])
                 logger.info(f"PDF Path is {file_path}")
@@ -887,7 +853,7 @@ class SignalBot:
                     return response
 
             # Always get the conversation history first
-            history = self._get_conversation_history(sender, 5)
+            history = self._get_conversation_history(sender, 3)
             context = f"Previous conversation: {history}\n\n" if history else ""
             full_prompt = f"{context}User: {message_text}"
 
@@ -928,7 +894,6 @@ class SignalBot:
                             file_path, filename, context=context
                         )
 
-                        update_processed_files(filename, status="SUCCESS")
                         print(
                             "----------------------------------------",
                             extracted_data and extracted_data.get("Is_Invoice", False),
@@ -954,9 +919,6 @@ class SignalBot:
 
                     except Exception as e:
                         logger.error(f"Background processing error: {str(e)}")
-                        update_processed_files(
-                            filename, status="FAILED", error_message=str(e)
-                        )
                         self.send_message(
                             sender, "❌ Error processing invoice. Please try again."
                         )
@@ -982,7 +944,6 @@ class SignalBot:
                         [f"{k}: {v}" for k, v in extracted_data.items()]
                     )
 
-                    update_processed_files(filename, status="SUCCESS")
                     if extracted_data.get("Is_Invoice", False):
                         invoice_data.Model_Abouts["Local_Path"] = stored_path
                         save_results_to_sheet([invoice_data.model_dump()])
@@ -1000,29 +961,7 @@ class SignalBot:
                 logger.info("Using RAG agent to process query")
                 try:
                     # Load local invoice data
-                    extract_files = [
-                        f
-                        for f in os.listdir(EXTRACTS_DIR)
-                        if f.startswith("invoice_results_") and f.endswith(".xlsx")
-                    ]
-                    if not extract_files:
-                        response = "❌ No invoice data found in local database."
-                        self.send_message(sender, response)
-                        return response
-
-                    latest_file = max(
-                        extract_files,
-                        key=lambda f: os.path.getmtime(os.path.join(EXTRACTS_DIR, f)),
-                    )
-                    df = pd.read_excel(os.path.join(EXTRACTS_DIR, latest_file))
-
-                    pandas_agent = create_pandas_agent(df)
-                    agent_result = pandas_agent.run(
-                        f"Answer this query about invoices: {full_prompt}. "
-                        "Respond clearly and concisely without code blocks."
-                    )
-
-                    response = agent_result
+                    response = create_excel_agent(full_prompt)
                     self.send_message(sender, response)
 
                 except Exception as e:
@@ -1081,56 +1020,31 @@ class SignalBot:
             elif router_output == "DELETE_AGENT":
                 logger.info("Using DELETE_AGENT")
                 try:
-                    extract_files = [
-                        f
-                        for f in os.listdir(EXTRACTS_DIR)
-                        if f.startswith("invoice_results_") and f.endswith(".xlsx")
-                    ]
-                    if not extract_files:
-                        self.send_message(sender, "❌ No invoices found to delete.")
-                        return
-
-                    latest_file = max(
-                        extract_files,
-                        key=lambda f: os.path.getmtime(os.path.join(EXTRACTS_DIR, f)),
-                    )
-                    df = pd.read_excel(os.path.join(EXTRACTS_DIR, latest_file))
-
-                    pandas_agent = create_pandas_agent(df)
-                    invoice_number = pandas_agent.run(
-                        f"Extract just the Invoice_Number from this request: '{message_text}'. "
-                        "Respond ONLY with the number or 'Not found'."
-                    )
-
-                    if invoice_number.lower() == "not found":
+                    response = create_excel_agent(f"Extract just the Invoice_Number from this request: '{message_text}'. "
+                        "Respond ONLY with the number or 'Not found'.")
+                    
+                    if response.lower() == "not found":
                         self.send_message(
                             sender, "❌ Could not identify invoice number to delete."
                         )
                         return
 
                     # Create new version without the deleted invoice
-                    new_df = df[df["Invoice_Number"] != invoice_number]
+                    new_df = df[df["Invoice_Number"] != response]
                     if len(new_df) < len(df):
                         new_file = os.path.join(
-                            EXTRACTS_DIR,
-                            f"invoice_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                            EXTRACTS_DIR,"extractedData.xlsx",
                         )
                         new_df.to_excel(new_file, index=False)
-
-                        update_processed_files(
-                            f"Invoice_{invoice_number}",
-                            status="DELETED",
-                            error_message=f"Deleted via user request at {datetime.now().isoformat()}",
-                        )
 
                         # Update embeddings
                         embed_and_upload_invoice_data()
                         self.send_message(
-                            sender, f"✅ Invoice {invoice_number} deleted successfully."
+                            sender, f"✅ Invoice {response} deleted successfully."
                         )
                     else:
                         self.send_message(
-                            sender, f"❌ Invoice {invoice_number} not found."
+                            sender, f"❌ Invoice {response} not found."
                         )
 
                 except Exception as e:
@@ -1457,7 +1371,6 @@ def main():
     )
 
     args = parser.parse_args()
-    EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
     # Refresh invoice data if requested
     if args.refresh_data:
