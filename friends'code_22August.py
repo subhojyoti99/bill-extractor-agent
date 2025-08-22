@@ -1113,6 +1113,8 @@ class SignalBot:
                             sender, "❌ Could not identify invoice number to delete."
                         )
                         return
+                    
+                    df = pd.read_excel(os.path.join(EXTRACTS_DIR, latest_file))
 
                     # Create new version without the deleted invoice
                     new_df = df[df["Invoice_Number"] != response]
