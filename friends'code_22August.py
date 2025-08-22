@@ -795,6 +795,14 @@ class SignalBot:
         self.event_db = LocalCache("events")  # Local cache for events
         self.cache_db = LocalCache("messages")  # Local cache for messages
 
+        self.llm = ChatOpenAI(
+            model="llama3-70b-8192",
+            temperature=0.2,
+            top_p=0.9,
+            openai_api_key=GROQ_API_KEY,
+            openai_api_base="https://api.groq.com/openai/v1"
+        )
+
         # Initialize router chain
         self.router_chain = create_router_chain()
 
