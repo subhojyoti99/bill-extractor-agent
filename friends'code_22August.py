@@ -1114,7 +1114,7 @@ class SignalBot:
                         )
                         return
                     
-                    df = pd.read_excel(os.path.join(EXTRACTS_DIR, latest_file))
+                    df = pd.read_excel(os.path.join(EXTRACTS_DIR, "extractedData.xlsx"))
 
                     # Create new version without the deleted invoice
                     new_df = df[df["Invoice_Number"] != response]
