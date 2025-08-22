@@ -765,11 +765,106 @@ class SignalBot:
             self.event_db.set(event_key, json.dumps(event_data))
 
             if has_attachment and len(attachments) > 1:
-                error_response = (
-                    "❌ Please send only one attachment at a time (image or PDF)."
-                )
-                self.send_message(sender, error_response)
-                return error_response
+                response = "📁 I received multiple files. I'll process them one by one with a brief pause between each to avoid rate limits."
+                self.send_message(sender, response)
+
+                def process_batch_attachments():
+                    try:
+                        successful_count = 0
+                        for i, attachment_path in enumerate(attachments):
+                            logger.info(
+                                f"Processing attachment {i+1}/{len(attachments)}"
+                            )
+
+                            # Convert PDF to image if needed
+                            if attachment_path.lower().endswith(".pdf"):
+                                file_path = pdf_to_image(attachment_path)
+                            else:
+                                file_path = attachment_path
+
+                            filename = os.path.basename(file_path)
+                            stored_path = store_uploaded_file(file_path)
+
+                            # Process the invoice
+                            try:
+                                _, extracted_data, invoice_data = analyze_invoice(
+                                    file_path, filename, context=""
+                                )
+                                response = (
+                                    "Here's what I found in the invoice:\n\n"
+                                    + "\n".join(
+                                        [f"{k}: {v}" for k, v in extracted_data.items()]
+                                    )
+                                )
+
+                                update_processed_files(filename, status="SUCCESS")
+
+                                if extracted_data and extracted_data.get(
+                                    "Is_Invoice", False
+                                ):
+                                    invoice_data.Model_Abouts["Local_Path"] = (
+                                        stored_path
+                                    )
+                                    save_results_to_sheet([invoice_data.model_dump()])
+                                    embed_and_upload_invoice_data()
+                                    self.send_message(sender, response)
+                                    response += (
+                                        "\n\n✅ Invoice saved to local database!"
+                                    )
+                                    # Send progress update
+                                    progress_msg = f"✅ Processed {i+1}/{len(attachments)}: {filename}"
+                                    if extracted_data.get("Invoice_Number"):
+                                        progress_msg += f" (Invoice #{extracted_data['Invoice_Number']})"
+                                    self.send_message(sender, progress_msg)
+                                    successful_count += 1
+                                else:
+                                    self.send_message(
+                                        sender,
+                                        f"❌ {filename} doesn't appear to be a valid invoice.",
+                                    )
+
+                            except Exception as e:
+                                logger.error(f"Error processing {filename}: {str(e)}")
+                                self.send_message(
+                                    sender, f"❌ Failed to process {filename}: {str(e)}"
+                                )
+
+                            # Wait 10 seconds between processing to avoid rate limits
+                            if (
+                                i < len(attachments) - 1
+                            ):  # Don't wait after the last one
+                                time.sleep(10)
+
+                        # Final completion message
+                        if successful_count > 0:
+                            self.send_message(
+                                sender,
+                                f"🎉 Finished processing {successful_count}/{len(attachments)} files successfully!",
+                            )
+                            # Update embeddings after batch processing
+                            embed_and_upload_invoice_data()
+                        else:
+                            self.send_message(
+                                sender,
+                                "❌ No valid invoices were processed from the batch.",
+                            )
+
+                    except Exception as e:
+                        logger.error(f"Batch processing error: {str(e)}")
+                        self.send_message(
+                            sender,
+                            "❌ Error during batch processing. Some files may not have been processed.",
+                        )
+
+                # Start batch processing in background
+                threading.Thread(target=process_batch_attachments, daemon=True).start()
+                return response
+
+                # error_response = (
+                #     "❌ Please send only one attachment at a time (image or PDF)."
+                # )
+                # self.send_message(sender, error_response)
+                # return error_response
 
             if has_attachment and attachments[0].lower().endswith(".pdf"):
                 file_path = pdf_to_image(attachments[0])
