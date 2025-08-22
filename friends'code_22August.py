@@ -192,14 +192,98 @@ def store_uploaded_file(file_path: str) -> str:
         return None
 
 
+# def save_results_to_sheet(results: List[Dict[str, Any]]) -> str:
+#     """
+#     Save/update invoice data in a single local Excel file (extractedData.xlsx),
+#     but split into month-wise sheets based on Invoice_Date.
+#     Returns path to the saved file
+#     """
+#     try:
+#         # Create DataFrame from new results
+#         new_df = pd.DataFrame(results)
+
+#         # Ensure Invoice_Date is in datetime format
+#         if "Invoice_Date" not in new_df.columns:
+#             raise ValueError("Missing 'Invoice_Date' column in results")
+#         new_df["Invoice_Date"] = pd.to_datetime(new_df["Invoice_Date"], errors="coerce")
+
+#         # Handle nested dictionaries (like Model_Abouts)
+#         for col in new_df.columns:
+#             if new_df[col].apply(lambda x: isinstance(x, dict)).any():
+#                 new_df[col] = new_df[col].apply(json.dumps)
+
+#         # Create directory if it doesn't exist
+#         os.makedirs(EXTRACTS_DIR, exist_ok=True)
+
+#         # Define the single output file path
+#         output_path = os.path.join(EXTRACTS_DIR, "extractedData.xlsx")
+
+#         # Dictionary to hold all sheet DataFrames
+#         sheet_data = {}
+
+#         # If file exists, load existing sheets
+#         if os.path.exists(output_path):
+#             try:
+#                 existing_sheets = pd.read_excel(output_path, sheet_name=None)  # Load all sheets
+#                 sheet_data.update(existing_sheets)
+#             except Exception as e:
+#                 logger.warning(f"Error reading existing file, creating new: {str(e)}")
+#                 sheet_data = {}
+
+#         # Group new data by month
+#         new_df["Month_Sheet"] = new_df["Invoice_Date"].dt.strftime("%B_%Y").str.lower()
+#         for sheet_name, group in new_df.groupby("Month_Sheet"):
+#             if sheet_name in sheet_data:
+#                 # Append to existing sheet
+#                 combined_df = pd.concat([sheet_data[sheet_name], group], ignore_index=True)
+#                 # Remove duplicates based on Invoice_Number if exists
+#                 if "Invoice_Number" in combined_df.columns:
+#                     combined_df = combined_df.drop_duplicates(
+#                         subset=["Invoice_Number"], keep="last"
+#                     )
+#                 sheet_data[sheet_name] = combined_df
+#             else:
+#                 sheet_data[sheet_name] = group
+
+#         # Save all sheets to Excel
+#         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+#             for sheet_name, df in sheet_data.items():
+#                 df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+#             # Add/update metadata sheet
+#             total_records = sum(len(df) for df in sheet_data.values())
+#             metadata = {
+#                 "Last_Updated": [datetime.now().isoformat()],
+#                 "Total_Records": [total_records],
+#                 "Sheets": [", ".join(sheet_data.keys())],
+#                 "New_Records_Added": [len(new_df)],
+#             }
+#             pd.DataFrame(metadata).to_excel(writer, index=False, sheet_name="Metadata")
+
+#         logger.info(
+#             f"Updated {output_path} with {len(new_df)} new records split into {len(sheet_data)} month-wise sheets"
+#         )
+#         return output_path
+
+#     except Exception as e:
+#         logger.error(f"Error saving results to Excel: {str(e)}")
+#         traceback.print_exc()
+#         return None
+
 def save_results_to_sheet(results: List[Dict[str, Any]]) -> str:
     """
-    Save/update invoice data in a single local Excel file (extractedData.xlsx)
+    Save/update invoice data in a single local Excel file (extractedData.xlsx),
+    but split into month-wise sheets based on Invoice_Date.
     Returns path to the saved file
     """
     try:
         # Create DataFrame from new results
         new_df = pd.DataFrame(results)
+
+        # Ensure Invoice_Date is in datetime format
+        if "Invoice_Date" not in new_df.columns:
+            raise ValueError("Missing 'Invoice_Date' column in results")
+        new_df["Invoice_Date"] = pd.to_datetime(new_df["Invoice_Date"], errors="coerce")
 
         # Handle nested dictionaries (like Model_Abouts)
         for col in new_df.columns:
@@ -212,50 +296,51 @@ def save_results_to_sheet(results: List[Dict[str, Any]]) -> str:
         # Define the single output file path
         output_path = os.path.join(EXTRACTS_DIR, "extractedData.xlsx")
 
-        # Check if file already exists
+        # Dictionary to hold all sheet DataFrames
+        sheet_data = {}
+
+        # If file exists, load existing sheets
         if os.path.exists(output_path):
             try:
-                # Read existing data
-                existing_df = pd.read_excel(output_path, sheet_name="Invoices")
+                existing_sheets = pd.read_excel(output_path, sheet_name=None)  # Load all sheets
+                sheet_data.update(existing_sheets)
+            except Exception as e:
+                sheet_data = {}
 
-                # Append new data to existing data
-                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-
-                # Remove duplicates based on Invoice_Number (if exists)
+        # Group new data by month
+        new_df["Month_Sheet"] = new_df["Invoice_Date"].dt.strftime("%B_%Y").str.lower()
+        for sheet_name, group in new_df.groupby("Month_Sheet"):
+            if sheet_name in sheet_data:
+                # Append to existing sheet
+                combined_df = pd.concat([sheet_data[sheet_name], group], ignore_index=True)
+                # Remove duplicates based on Invoice_Number if exists
                 if "Invoice_Number" in combined_df.columns:
                     combined_df = combined_df.drop_duplicates(
                         subset=["Invoice_Number"], keep="last"
                     )
-            except Exception as e:
-                logger.warning(f"Error reading existing file, creating new: {str(e)}")
-                combined_df = new_df
-        else:
-            combined_df = new_df
+                sheet_data[sheet_name] = combined_df
+            else:
+                sheet_data[sheet_name] = group
 
-        # Save to Excel
+        # Save all sheets to Excel
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            # Save main data
-            combined_df.to_excel(writer, index=False, sheet_name="Invoices")
+            for sheet_name, df in sheet_data.items():
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
 
-            # Add/update metadata
+            # Add/update metadata sheet
+            total_records = sum(len(df) for df in sheet_data.values())
             metadata = {
                 "Last_Updated": [datetime.now().isoformat()],
-                "Total_Records": [len(combined_df)],
-                "Columns": [", ".join(combined_df.columns)],
+                "Total_Records": [total_records],
+                "Sheets": [", ".join(sheet_data.keys())],
                 "New_Records_Added": [len(new_df)],
             }
             pd.DataFrame(metadata).to_excel(writer, index=False, sheet_name="Metadata")
-
-        logger.info(
-            f"Updated {output_path} with {len(new_df)} new records (Total: {len(combined_df)})"
-        )
+        
         return output_path
 
     except Exception as e:
-        logger.error(f"Error saving results to Excel: {str(e)}")
-        traceback.print_exc()
         return None
-
 
 
 def save_invoices_to_sqlite(df: pd.DataFrame):
